@@ -1,0 +1,72 @@
+[project]
+name = "snakemake-software-deployment-plugin-pixi"
+version = "0.1.0"
+authors = [{ name = "Cade Mirchandani", email = "cademirch@gmail.com" }]
+description = "Software deployment plugin for Snakemake using rattler to deploy conda packages."
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "snakemake-interface-common (>=1.23.0,<2.0.0)",
+    "snakemake-interface-software-deployment-plugins (>=0.17.0,<1.0)",
+    "py-rattler (>=0.12.0,<0.16.0)",
+    "aiofiles (>=24.1.0,<25)",
+    "httpx (>=0.28.1,<0.29)",
+]
+
+[tool.pixi.pypi-dependencies]
+snakemake-software-deployment-plugin-pixi = { path = ".", editable = true }
+
+
+[project.urls]
+repository = "https://github.com/snakemake/snakemake-software-deployment-plugin-pixi"
+documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/software-deployment/pixi.html"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.environments]
+dev = { features = ["dev"] }
+publish = { features = ["publish"] }
+
+[tool.pixi.feature.dev.pypi-dependencies]
+pytest = ">=8.3.5,<9"
+ruff = ">=0.10.0,<0.11"
+pytest-cov = ">=6.0.0,<7"
+pyrefly = ">=0.52.0,<0.53"
+
+
+[tool.pixi.feature.dev.tasks]
+format = "ruff format"
+lint = "ruff check"
+typecheck = "pyrefly check"
+qc = { depends-on = ["format", "lint"] }
+coverage-report = "coverage report -m"
+
+[tool.pixi.feature.dev.tasks.test]
+cmd = [
+    "pytest",
+    "--cov=snakemake_software_deployment_plugin_pixi",
+    "--cov-report=xml:coverage-report/coverage.xml",
+    "--cov-report=term-missing",
+    "tests/test_plugin.py",
+]
+
+[tool.coverage.report]
+exclude_lines = ["pass", "\\.\\.\\."]
+fail_under = 68.0
+
+# Publish
+[tool.pixi.feature.publish.pypi-dependencies]
+twine = ">=6.1.0,<7"
+build = ">=1.2.2,<2"
+
+[tool.pixi.feature.publish.tasks]
+build = { cmd = "python -m build", description = "Build the package into the dist/ directory" }
+check-build = { cmd = "python -m twine check dist/*", depends-on = [
+    "build",
+], description = "Check that the package can be uploaded" }
