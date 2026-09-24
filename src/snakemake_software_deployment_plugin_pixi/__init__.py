@@ -1,6 +1,11 @@
 import shlex
+import subprocess
+import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
+from threading import Lock
 from typing import Iterable, List, Optional
 
 import aiofiles
@@ -51,16 +56,14 @@ def _parse_lockfile(lockfile_path: Path) -> LockFile:
 def _get_conda_records_for_env(
     lockfile: LockFile,
     env_name: str,
-    platforms: Optional[List[Platform]] = None,
 ) -> List[RepoDataRecord]:
     """Extract conda RepoDataRecords for a given environment and platform(s)."""
     env = _get_lockfile_env(lockfile, env_name)
-
-    if platforms is None:
-        platforms = [Platform.current()]
+    platforms = env.platforms()
 
     records = []
     for platform in platforms:
+        print(f"{platform=}")
         platform_records = env.conda_repodata_records_for_platform(platform)
         if platform_records is not None:
             records.extend(platform_records)
@@ -81,13 +84,10 @@ def _get_conda_records_for_env(
 def _get_pypi_packages_for_env(
     lockfile: LockFile,
     env_name: str,
-    platforms: Optional[List[Platform]] = None,
 ) -> List[PypiLockedPackage]:
     """Extract PyPI locked packages for a given environment and platform(s)."""
     env = _get_lockfile_env(lockfile, env_name)
-
-    if platforms is None:
-        platforms = [Platform.current()]
+    platforms = env.platforms()
 
     packages = []
     for platform in platforms:
@@ -146,8 +146,8 @@ class EnvSpec(EnvSpecBase):
         if self.frozen and self.locked:
             raise WorkflowError(
                 "Cannot set both frozen=True and locked=True. "
-                "Use frozen to prevent any lockfile updates, or "
-                "locked to allow only lockfile updates (no manifest changes)."
+                "Use frozen to install from the existing lockfile, or "
+                "locked to require a lockfile that matches the manifest."
             )
 
     @classmethod
@@ -168,10 +168,9 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
     spec: EnvSpec
 
     def __post_init__(self):
-        self._lockfile_cache: Optional[LockFile] = None
-        self._conda_records_cache: Optional[List[RepoDataRecord]] = None
-        self._pypi_packages_cache: Optional[List[PypiLockedPackage]] = None
-        self._cache_assets: Optional[dict] = None
+        # Python 3.11 cached_property already holds a shared reentrant lock.
+        # Adding an outer instance lock there can deadlock nested environments.
+        self._shell_hook_lock = Lock() if sys.version_info >= (3, 12) else nullcontext()
 
     @property
     def workspace_path(self) -> Path:
@@ -187,11 +186,9 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
     def lockfile_path(self) -> Path:
         return _resolve_lockfile(self.workspace_path)
 
-    @property
+    @cached_property
     def lockfile(self) -> LockFile:
-        if self._lockfile_cache is None:
-            self._lockfile_cache = _parse_lockfile(self.lockfile_path)
-        return self._lockfile_cache
+        return _parse_lockfile(self.lockfile_path)
 
     @property
     def manifest_path(self) -> Path:
@@ -208,50 +205,76 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
     def _platforms(self) -> List[Platform]:
         return [Platform.current(), Platform("noarch")]
 
-    @property
+    @cached_property
     def conda_records(self) -> List[RepoDataRecord]:
-        if self._conda_records_cache is None:
-            self._conda_records_cache = _get_conda_records_for_env(
-                self.lockfile, self.spec.env, self._platforms()
-            )
-        return self._conda_records_cache
+        return _get_conda_records_for_env(self.lockfile, self.spec.env)
 
-    @property
+    @cached_property
     def pypi_packages(self) -> List[PypiLockedPackage]:
-        if self._pypi_packages_cache is None:
-            self._pypi_packages_cache = _get_pypi_packages_for_env(
-                self.lockfile, self.spec.env, self._platforms()
-            )
-        return self._pypi_packages_cache
+        return _get_pypi_packages_for_env(self.lockfile, self.spec.env)
 
     def env_prefix(self) -> Path:
         """The conda prefix where pixi installs the environment."""
         return self.workspace_path / ".pixi" / "envs" / self.spec.env
 
-    def _pixi_run_prefix(self) -> str:
-        """Build the `pixi run` command prefix with proper quoting."""
+    @property
+    def pixi_shell(self) -> str:
+        """Map the configured shell to a pixi activation script type."""
+        name = self.shell_executable.name
+        if name in ("bash", "dash", "sh", "ksh", "brush"):
+            return "bash"
+        if name in ("zsh", "xonsh", "fish"):
+            return name
+        raise WorkflowError(
+            "Unsupported shell executable for "
+            f"snakemake-software-deployment-plugin-pixi: {name}"
+        )
+
+    @property
+    def shell_hook(self) -> str:
+        """Serialize access so concurrent jobs generate the hook only once."""
+        # cached_property stores the value before this outer lock is released.
+        with self._shell_hook_lock:
+            return self._shell_hook
+
+    @cached_property
+    def _shell_hook(self) -> str:
+        """Generate and cache the activation script for this environment."""
+        manifest = self.manifest_path.absolute()
         parts = [
             "pixi",
-            "run",
-            "-e",
-            shlex.quote(self.spec.env),
+            "shell-hook",
+            "--shell",
+            self.pixi_shell,
+            "--environment",
+            self.spec.env,
             "--manifest-path",
-            shlex.quote(str(self.manifest_path)),
+            str(manifest),
         ]
         if self.spec.frozen:
             parts.append("--frozen")
         elif self.spec.locked:
             parts.append("--locked")
-        return " ".join(parts)
+        try:
+            result = self.run_cmd(
+                shlex.join(parts), capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError as e:
+            raise WorkflowError(
+                f"Failed to generate pixi shell hook for environment "
+                f"'{self.spec.env}' from {manifest} (exit {e.returncode}):\n"
+                f"{e.stderr or str(e)}"
+            ) from e
+        except OSError as e:
+            raise WorkflowError(
+                f"Could not run pixi shell-hook for environment "
+                f"'{self.spec.env}' from {manifest}: {e}"
+            ) from e
+        return result.stdout
 
     def decorate_shellcmd(self, cmd: str) -> str:
-        """Wrap the command with `pixi run` to execute inside the environment.
-
-        Using `pixi run` rather than raw conda activation ensures that
-        pixi's own activation hooks, post-link scripts, and environment
-        variables are all applied correctly.
-        """
-        return f"{self._pixi_run_prefix()} -- {cmd}"
+        """Activate the environment in the configured shell before the command."""
+        return f"{self.shell_hook}\n{cmd}"
 
     def contains_executable(self, executable: str) -> bool:
         return (self.env_prefix() / "bin" / executable).exists()
@@ -260,7 +283,7 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
         return True
 
     def record_hash(self, hash_object) -> None:
-        """Hash the lockfile content + environment name.
+        """Hash the lockfile content, environment name, and activation shell.
 
         The lockfile pins every package version, hash, and URL for each
         platform, so hashing its content gives us a complete picture of what
@@ -270,6 +293,10 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
         if lockfile_path.exists():
             hash_object.update(lockfile_path.read_bytes())
         hash_object.update(self.spec.env.encode())
+        # Snakemake deduplicates Env instances by this hash. Different shell
+        # dialects must not share an instance and its cached activation script.
+        hash_object.update(b"\0shell\0")
+        hash_object.update(self.pixi_shell.encode())
 
     def is_pinnable(self) -> bool:
         return True
@@ -295,32 +322,32 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
             if pypi_pkgs:
                 await f.write("@PYPI\n")
                 for pkg in pypi_pkgs:
-                    if pkg.is_editable or not _is_remote_url(pkg.location):
+                    if not _is_remote_url(pkg.location):
                         continue
                     await f.write(f"{pkg.location}\n")
 
     def is_cacheable(self) -> bool:
         return True
 
+    @cached_property
+    def _cache_assets(self) -> dict:
+        assets: dict = {}
+        # Conda packages
+        for record in self.conda_records:
+            name = _record_to_asset_name(record)
+            assets[name] = ("conda", record)
+        # HTTP(S) artifacts only; local/editable and Git sources are excluded.
+        for pkg in self.pypi_packages:
+            if not _is_remote_url(pkg.location):
+                continue
+            name = _pypi_to_asset_name(pkg)
+            assets[name] = ("pypi", pkg)
+        return assets
+
     async def get_cache_assets(self) -> Iterable[str]:
-        if self._cache_assets is None:
-            self._cache_assets = {}
-            # Conda packages
-            for record in self.conda_records:
-                name = _record_to_asset_name(record)
-                self._cache_assets[name] = ("conda", record)
-            # PyPI packages (only remote URLs, skip editable/local path deps)
-            for pkg in self.pypi_packages:
-                if pkg.is_editable or not _is_remote_url(pkg.location):
-                    continue
-                name = _pypi_to_asset_name(pkg)
-                self._cache_assets[name] = ("pypi", pkg)
         return self._cache_assets.keys()
 
     async def cache_asset(self, asset: str, to_path: Path) -> None:
-        assert self._cache_assets is not None, (
-            "bug: get_cache_assets must be called before cache_asset"
-        )
         kind, record = self._cache_assets[asset]
         url = record.url if kind == "conda" else record.location
         async with httpx.AsyncClient() as client:
