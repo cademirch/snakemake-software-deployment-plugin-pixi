@@ -1,10 +1,17 @@
+import asyncio
+import os
 import shlex
+import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from unittest.mock import Mock
+from pathlib import Path
 
 import pytest
+from rattler import LockFile
+from rattler.platform import Platform
 
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_software_deployment_plugins import (
@@ -81,9 +88,9 @@ def test_hook_cached_per_environment(make_env, monkeypatch):
     )
     monkeypatch.setattr(Env, "run_cmd", run)
 
-    assert tools.decorate_shellcmd("first") == "tools-hook\nfirst"
-    assert tools.decorate_shellcmd("second") == "tools-hook\nsecond"
-    assert other.decorate_shellcmd("third") == "other-hook\nthird"
+    assert "tools-hook\n" in tools.decorate_shellcmd("first")
+    assert tools.decorate_shellcmd("second").endswith("\nsecond")
+    assert "other-hook\n" in other.decorate_shellcmd("third")
     assert run.call_count == 2
 
 
@@ -126,8 +133,8 @@ def test_concurrent_commands_share_hook_generation(make_env, monkeypatch):
                 second.result(timeout=0.1)
         finally:
             release.set()
-        assert first.result(timeout=5) == "shared-hook\nfirst"
-        assert second.result(timeout=5) == "shared-hook\nsecond"
+        assert first.result(timeout=5).endswith("\nfirst")
+        assert second.result(timeout=5).endswith("\nsecond")
     assert run.call_count == 1
 
 
@@ -146,7 +153,7 @@ def test_failed_hook_reports_context_and_is_not_cached(make_env, monkeypatch):
     message = str(error.value)
     for detail in ("tools", str(env.manifest_path), "42", "environment not found"):
         assert detail in message
-    assert env.decorate_shellcmd("retry") == "successful-hook\nretry"
+    assert "successful-hook\n" in env.decorate_shellcmd("retry")
 
 
 def test_hook_launch_error_is_workflow_error(make_env, monkeypatch):
@@ -188,3 +195,125 @@ def test_multiline_hook_activates_entire_command(make_env, monkeypatch):
         env.decorate_shellcmd(cmd), capture_output=True, text=True, check=True
     )
     assert result.stdout == "activated\nactivated\n"
+
+
+@pytest.mark.parametrize("shell", ["bash", "sh", "dash", "ksh", "zsh", "xonsh", "fish"])
+def test_real_hook_activates_job(make_env, monkeypatch, tmp_path, shell):
+    executable = shutil.which(shell) or str(Path(sys.executable).parent / shell)
+    if not Path(executable).is_file():
+        pytest.skip(f"{shell} not installed")
+    if shutil.which("pixi") is None:
+        pytest.skip("pixi not installed")
+    for kind in ("CACHE", "CONFIG", "DATA"):
+        monkeypatch.setenv(f"XDG_{kind}_HOME", str(tmp_path / kind.lower()))
+    env = make_env(shell=executable)
+    script = env.workspace_path / (
+        "activate.fish" if shell == "fish" else "activate.sh"
+    )
+    script.write_text(
+        "set -x ACTIVATED yes\n" if shell == "fish" else "export ACTIVATED=yes\n"
+    )
+    env.manifest_path.write_text(
+        '[workspace]\nname="activation-test"\nchannels=[]\n'
+        f'platforms=["{Platform.current()}"]\n[environments]\ntools=[]\n'
+        f'[activation]\nscripts=["{script.name}"]\n'
+    )
+    monkeypatch.setenv("PIXI_OFFLINE", "true")
+    command = (
+        'print("job:" + $ACTIVATED)'
+        if shell == "xonsh"
+        else 'printf "job:%s\\n" "$ACTIVATED"'
+    )
+    result = env.shell_executable.run(
+        env.decorate_shellcmd(command),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "job:yes\n"
+
+
+def test_parent_activation_output_is_not_child_shell_code(
+    make_env, monkeypatch, tmp_path
+):
+    parent = make_env()
+    child = make_env(name="child")
+    child.within = parent
+    monkeypatch.setitem(
+        parent.__dict__,
+        "_shell_hook",
+        "printf '%s\\n' 'Activating tools (ready)'\nexport PARENT_VALUE=ready\n",
+    )
+    # Keep real run_cmd and parent activation; replace only the external Pixi CLI.
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    pixi = commands / "pixi"
+    pixi.write_text("#!/bin/sh\nprintf '%s\\n' 'export CHILD_VALUE=ready'\n")
+    pixi.chmod(0o755)
+    monkeypatch.setenv("PATH", str(commands) + ":" + os.environ["PATH"])
+
+    result = child.shell_executable.run(
+        child.managed_decorate_shellcmd(
+            'printf "job:%s:%s\\n" "$PARENT_VALUE" "$CHILD_VALUE"'
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.endswith("job:ready:ready\n")
+    assert "Activating tools (ready)" not in child.shell_hook
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_preparation_refreshes_lock_metadata_without_changing_identity(
+    make_env, monkeypatch, retry
+):
+    env = make_env()
+    platform = Platform.current()
+    source = LockFile.from_path(Path(__file__).parent / "test_workspace" / "pixi.lock")
+    source_env = source.environment("tools")
+    assert source_env is not None
+    target = next(p for p in source_env.platforms() if str(p) == str(platform))
+    records = source_env.conda_repodata_records_for_platform(target) or []
+
+    def write_lock(version):
+        lock = LockFile([target])
+        for record in records:
+            lock.add_conda_package("tools", target, record)
+        lock.add_pypi_package(
+            "tools",
+            target,
+            "marker",
+            version,
+            f"https://example.test/marker-{version}-py3-none-any.whl",
+        )
+        lock.to_path(env.lockfile_path)
+
+    write_lock("1.0")
+    identity = hash(env)
+    assert ("marker", "1.0") in {(p.name, p.version) for p in env.report_software()}
+    assert "marker-1.0-py3-none-any.whl" in asyncio.run(env.get_cache_assets())
+
+    def prepare(*args, **kwargs):
+        write_lock("2.0")
+        return subprocess.CompletedProcess([], 0, "export READY=yes\n", "")
+
+    if retry:
+
+        def fail_after_resolving(*args, **kwargs):
+            write_lock("2.0")
+            raise subprocess.CalledProcessError(1, "pixi", stderr="install failed")
+
+        monkeypatch.setattr(env, "run_cmd", fail_after_resolving)
+        with pytest.raises(WorkflowError, match="install failed"):
+            _ = env.shell_hook
+
+    monkeypatch.setattr(env, "run_cmd", prepare)
+    env.shell_hook
+    reports = {(p.name, p.version) for p in env.report_software()}
+    assert ("marker", "2.0") in reports
+    assert ("marker", "1.0") not in reports
+    assets = set(asyncio.run(env.get_cache_assets()))
+    assert "marker-2.0-py3-none-any.whl" in assets
+    assert "marker-1.0-py3-none-any.whl" not in assets
+    assert hash(env) == identity

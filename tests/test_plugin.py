@@ -5,6 +5,7 @@ from typing import Optional, Type
 
 import pytest
 from rattler import LockFile
+from rattler.platform import Platform
 
 from snakemake_interface_software_deployment_plugins.tests import (
     TestSoftwareDeploymentBase,
@@ -159,12 +160,12 @@ class TestPixiImplicitWorkspace(_PixiTestBase):
 
 @pytest.fixture
 def pypi_env_with_local_packages(tmp_path):
-    env = TestPixiPypi()._get_env(tmp_path)
-    assert isinstance(env, Env)
     source_lockfile = LockFile.from_path(
         TESTS_DIR / "test_workspace_pypi" / "pixi.lock"
     )
-    platform = source_lockfile.platforms()[0]
+    platform = next(
+        p for p in source_lockfile.platforms() if str(p) == str(Platform.current())
+    )
     source = source_lockfile.environment("pypitest")
     assert source is not None
     lockfile = LockFile([platform])
@@ -182,8 +183,15 @@ def pypi_env_with_local_packages(tmp_path):
     ):
         lockfile.add_pypi_package("pypitest", platform, name, "1.0", location)
     lockfile.to_path(tmp_path / "pixi.lock")
-    env.spec.workspace = EnvSpecSourceFile(tmp_path, cached=tmp_path)
-    return env
+    (tmp_path / "pixi.toml").write_bytes(
+        (TESTS_DIR / "test_workspace_pypi" / "pixi.toml").read_bytes()
+    )
+    return TestPixiPypi()._get_env_by_cls(
+        Env,
+        EnvSpec(workspace=EnvSpecSourceFile(tmp_path, cached=tmp_path), env="pypitest"),
+        None,
+        tmp_path,
+    )
 
 
 def test_pypi_pin_includes_remote_packages_only(pypi_env_with_local_packages):
