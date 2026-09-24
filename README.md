@@ -9,6 +9,8 @@ It requires pixi on `PATH` and `snakemake>=10`.
 ## Usage
 
 Set `workspace` to the pixi workspace directory and `env` to the environment name.
+Relative workspace paths are relative to the file that defines the rule.
+The workspace must be a local directory that the job can access.
 This example uses an `alignment` environment that contains `samtools`:
 
 ```python
@@ -45,6 +47,8 @@ The `frozen` and `locked` options cannot both be `True`.
 The plugin uses the shell configured in Snakemake.
 Supported shells are Bash, dash, sh, ksh, brush, Zsh, Xonsh, and fish.
 
+The plugin runs Pixi's activation script before each rule command.
+
 
 ## Development
 
@@ -63,5 +67,3 @@ pixi run -e dev lint                         # Lint
 pixi run -e dev format                       # Format
 pixi run -e dev typecheck                    # Type checks
 ```
-
-

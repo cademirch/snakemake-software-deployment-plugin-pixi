@@ -1,6 +1,7 @@
 import shlex
 import subprocess
 import sys
+import tempfile
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import cached_property
@@ -57,44 +58,36 @@ def _get_conda_records_for_env(
     lockfile: LockFile,
     env_name: str,
 ) -> List[RepoDataRecord]:
-    """Extract conda RepoDataRecords for a given environment and platform(s)."""
+    """Extract conda records for the current platform, including noarch packages."""
     env = _get_lockfile_env(lockfile, env_name)
-    platforms = env.platforms()
-
-    records = []
-    for platform in platforms:
-        print(f"{platform=}")
-        platform_records = env.conda_repodata_records_for_platform(platform)
-        if platform_records is not None:
-            records.extend(platform_records)
-
-    if not records:
-        available_platforms = env.platforms()
-        raise WorkflowError(
-            f"Pixi lockfile has no packages for the current platform "
-            f"({Platform.current()}) in environment '{env_name}'. "
-            f"Available platforms: {', '.join(str(p) for p in available_platforms)}. "
-            f"Add your platform to the [workspace] platforms list in the manifest "
-            f"and run 'pixi lock' to regenerate the lockfile."
-        )
-
-    return records
+    platform = _get_current_lockfile_platform(lockfile, env, env_name)
+    return env.conda_repodata_records_for_platform(platform) or []
 
 
 def _get_pypi_packages_for_env(
     lockfile: LockFile,
     env_name: str,
 ) -> List[PypiLockedPackage]:
-    """Extract PyPI locked packages for a given environment and platform(s)."""
+    """Extract PyPI locked packages for the current platform."""
     env = _get_lockfile_env(lockfile, env_name)
-    platforms = env.platforms()
+    platform = _get_current_lockfile_platform(lockfile, env, env_name)
+    return env.pypi_packages_for_platform(platform) or []
 
-    packages = []
+
+def _get_current_lockfile_platform(lockfile: LockFile, env, env_name: str):
+    # Pixi represents dependency-free environments with an empty packages map.
+    platforms = env.platforms() or lockfile.platforms()
+    current = str(Platform.current())
     for platform in platforms:
-        platform_packages = env.pypi_packages_for_platform(platform)
-        if platform_packages is not None:
-            packages.extend(platform_packages)
-    return packages
+        if str(platform) == current:
+            return platform
+    raise WorkflowError(
+        f"Pixi lockfile does not support the current platform "
+        f"({current}) in environment '{env_name}'. "
+        f"Available platforms: {', '.join(str(p) for p in platforms)}. "
+        "Add your platform to the [workspace] platforms list in the manifest "
+        "and run 'pixi lock' to regenerate the lockfile."
+    )
 
 
 def _get_lockfile_env(lockfile: LockFile, env_name: str):
@@ -154,6 +147,8 @@ class EnvSpec(EnvSpecBase):
     def identity_attributes(cls) -> Iterable[str]:
         yield "workspace"
         yield "env"
+        yield "frozen"
+        yield "locked"
 
     @classmethod
     def source_path_attributes(cls) -> Iterable[str]:
@@ -168,19 +163,25 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
     spec: EnvSpec
 
     def __post_init__(self):
+        self._workspace_base = Path.cwd()
         # Python 3.11 cached_property already holds a shared reentrant lock.
         # Adding an outer instance lock there can deadlock nested environments.
         self._shell_hook_lock = Lock() if sys.version_info >= (3, 12) else nullcontext()
 
-    @property
+    @cached_property
     def workspace_path(self) -> Path:
-        """Resolve the workspace directory."""
+        """Resolve the original local directory relative to the invocation directory."""
         if self.spec.workspace is not None:
-            assert self.spec.workspace.cached is not None
-            return self.spec.workspace.cached
-        # If no workspace specified, use the workflow root (deployment prefix parent).
-        # The framework should resolve this via source_path_attributes.
-        return Path(".")
+            # Snakemake resolves path_or_uri relative to the defining rule, but its
+            # file source cache cannot copy a workspace directory or its contents.
+            workspace = self.spec.workspace.path_or_uri
+            if "://" in str(workspace):
+                raise WorkflowError(
+                    "Pixi workspace must be a local directory path; "
+                    "workspace URIs are not supported."
+                )
+            return (self._workspace_base / workspace).resolve()
+        return self._workspace_base
 
     @property
     def lockfile_path(self) -> Path:
@@ -201,9 +202,6 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
         raise WorkflowError(
             f"No pixi manifest (pixi.toml or pyproject.toml) found in {ws}"
         )
-
-    def _platforms(self) -> List[Platform]:
-        return [Platform.current(), Platform("noarch")]
 
     @cached_property
     def conda_records(self) -> List[RepoDataRecord]:
@@ -256,9 +254,25 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
         elif self.spec.locked:
             parts.append("--locked")
         try:
-            result = self.run_cmd(
-                shlex.join(parts), capture_output=True, text=True, check=True
-            )
+            command = shlex.join(parts)
+            if self.within is None:
+                result = self.run_cmd(
+                    command, capture_output=True, text=True, check=True
+                )
+                hook = result.stdout
+            else:
+                # This directory is mounted in parent environments. Redirect only
+                # Pixi's output so parent activation messages never become code.
+                self._deployment_prefix.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=self._deployment_prefix) as tmp:
+                    output = Path(tmp) / "shell-hook"
+                    self.run_cmd(
+                        f"{command} > {shlex.quote(str(output))}",
+                        text=True,
+                        stderr=subprocess.PIPE,
+                        check=True,
+                    )
+                    hook = output.read_text()
         except subprocess.CalledProcessError as e:
             raise WorkflowError(
                 f"Failed to generate pixi shell hook for environment "
@@ -270,33 +284,51 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
                 f"Could not run pixi shell-hook for environment "
                 f"'{self.spec.env}' from {manifest}: {e}"
             ) from e
-        return result.stdout
+        # An earlier failed install or another environment can also have changed
+        # the lockfile. Refresh metadata after preparation without changing the
+        # cached hash that Snakemake already uses as a dictionary key.
+        for attribute in (
+            "lockfile",
+            "conda_records",
+            "pypi_packages",
+            "_cache_assets",
+        ):
+            self.__dict__.pop(attribute, None)
+        return hook
 
     def decorate_shellcmd(self, cmd: str) -> str:
         """Activate the environment in the configured shell before the command."""
         return f"{self.shell_hook}\n{cmd}"
 
     def contains_executable(self, executable: str) -> bool:
+        # Snakemake selects a script's interpreter before decorating its command.
+        # Prepare the environment before checking which executables it provides.
+        _ = self.shell_hook
         return (self.env_prefix() / "bin" / executable).exists()
 
     def hash_include_within(self) -> bool:
         return True
 
     def record_hash(self, hash_object) -> None:
-        """Hash the lockfile content, environment name, and activation shell.
-
-        The lockfile pins every package version, hash, and URL for each
-        platform, so hashing its content gives us a complete picture of what
-        the environment should contain.
-        """
+        """Keep workspace activation and lockfile policies distinct during reuse."""
+        manifest = self.manifest_path
         lockfile_path = self.lockfile_path
-        if lockfile_path.exists():
-            hash_object.update(lockfile_path.read_bytes())
-        hash_object.update(self.spec.env.encode())
-        # Snakemake deduplicates Env instances by this hash. Different shell
-        # dialects must not share an instance and its cached activation script.
-        hash_object.update(b"\0shell\0")
-        hash_object.update(self.pixi_shell.encode())
+        has_lockfile = lockfile_path.exists()
+        fields = (
+            str(self.workspace_path.resolve()).encode(),
+            manifest.name.encode(),
+            manifest.read_bytes(),
+            str(has_lockfile).encode(),
+            lockfile_path.read_bytes() if has_lockfile else b"",
+            self.spec.env.encode(),
+            self.pixi_shell.encode(),
+            str(self.spec.frozen).encode(),
+            str(self.spec.locked).encode(),
+        )
+        for value in fields:
+            # Length framing prevents adjacent fields from sharing an encoding.
+            hash_object.update(len(value).to_bytes(8, "big"))
+            hash_object.update(value)
 
     def is_pinnable(self) -> bool:
         return True
@@ -345,6 +377,12 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
         return assets
 
     async def get_cache_assets(self) -> Iterable[str]:
+        # Cache discovery also runs during dry runs, before lazy Pixi preparation.
+        # A missing unlocked lockfile must not prevent the first real install.
+        if not self.lockfile_path.exists() and not (
+            self.spec.frozen or self.spec.locked
+        ):
+            return ()
         return self._cache_assets.keys()
 
     async def cache_asset(self, asset: str, to_path: Path) -> None:
@@ -364,7 +402,7 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
             for record in self.conda_records:
                 reports.append(
                     SoftwareReport(
-                        name=str(record.name),
+                        name=record.name.normalized,
                         version=str(record.version),
                     )
                 )
