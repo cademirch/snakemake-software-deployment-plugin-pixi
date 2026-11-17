@@ -35,7 +35,7 @@ def test_workflow_reruns_only_for_selected_environment_changes(tmp_path):
     (workspace / "Snakefile").write_text(
         "rule probe:\n"
         '    output: "result.txt"\n'
-        '    software: pixi(workspace=".", env="tools")\n'
+        '    software: pixi(manifest="pixi.toml", env="tools")\n'
         f"    shell: {command!r}\n"
     )
     process_env = {

@@ -35,8 +35,9 @@ def manager(tmp_path):
     return SoftwareDeploymentManager(cast("Workflow", workflow))
 
 
-def make_spec(workspace, **options):
-    spec = EnvSpec(workspace=EnvSpecSourceFile(workspace, cached=workspace), **options)
+def make_spec(workspace, filename="pixi.toml", **options):
+    manifest = workspace / filename
+    spec = EnvSpec(manifest=EnvSpecSourceFile(manifest, cached=manifest), **options)
     spec.technical_init()
     return spec
 
@@ -135,3 +136,20 @@ def test_manifest_comments_do_not_invalidate_environment_hash(manager, tmp_path)
     after = SoftwareDeploymentManager(manager.workflow).get_env(make_spec(tmp_path))
     assert after is not None
     assert after.hash() == before
+
+
+def test_manager_keeps_exact_manifests_in_same_directory_distinct(manager, tmp_path):
+    # Identical selected environment content leaves only the exact file identity
+    # to distinguish these two manifests in Snakemake's Env deduplication.
+    environment = "tools={features=[], no-default-feature=true}\n"
+    (tmp_path / "pixi.toml").write_text("[workspace]\n[environments]\n" + environment)
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pixi.workspace]\n[tool.pixi.environments]\n" + environment
+    )
+    first = manager.get_env(make_spec(tmp_path, filename="pixi.toml", env="tools"))
+    second = manager.get_env(
+        make_spec(tmp_path, filename="pyproject.toml", env="tools")
+    )
+    assert first is not second
+    assert first.manifest_path == tmp_path / "pixi.toml"
+    assert second.manifest_path == tmp_path / "pyproject.toml"

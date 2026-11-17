@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from threading import Lock
-from typing import Iterable, List, Optional
+from typing import Iterable, List
 
 import aiofiles
 
@@ -104,38 +104,40 @@ def _get_lockfile_env(lockfile: LockFile, env_name: str):
 
 @dataclass(eq=False)
 class EnvSpec(EnvSpecBase):
-    """Specification for a pixi environment.
+    """Select an environment from an explicit local Pixi manifest.
 
     Usage in Snakefiles::
 
         rule align:
             software:
-                pixi(workspace="envs/biotools/", env="alignment")
-
-        rule call:
-            software:
-                # workspace defaults to the workflow root
-                pixi(env="calling")
+                pixi(manifest="envs/biotools/pixi.toml", env="alignment")
 
         rule default:
             software:
-                # env defaults to "default"
-                pixi(workspace="envs/biotools/")
+                pixi(manifest="pyproject.toml")
 
-    To enable post-link scripts (e.g. for graphviz dot plugin registration),
-    add to the workspace's .pixi/config.toml::
+    Relative manifest paths belong to the file defining the rule, including
+    included rules and modules. The environment name defaults to "default".
 
-        run-post-link-scripts = "insecure"
-
-    Or run: pixi config set --local run-post-link-scripts insecure
+    To enable post-link scripts (for example, graphviz plugin registration),
+    set run-post-link-scripts = "insecure" in the workspace's .pixi/config.toml.
     """
 
-    workspace: Optional[EnvSpecSourceFile] = None
+    manifest: EnvSpecSourceFile
     env: str = "default"
     frozen: bool = False
     locked: bool = False
 
     def __post_init__(self):
+        if (
+            not isinstance(self.manifest, EnvSpecSourceFile)
+            or self.manifest.path_or_uri is None
+            or not str(self.manifest.path_or_uri).strip()
+        ):
+            raise WorkflowError(
+                "Pixi manifest is required. Provide the path to a local "
+                "pixi.toml or pyproject.toml file."
+            )
         if self.frozen and self.locked:
             raise WorkflowError(
                 "Cannot set both frozen=True and locked=True. "
@@ -145,43 +147,51 @@ class EnvSpec(EnvSpecBase):
 
     @classmethod
     def identity_attributes(cls) -> Iterable[str]:
-        yield "workspace"
+        yield "manifest"
         yield "env"
         yield "frozen"
         yield "locked"
 
     @classmethod
     def source_path_attributes(cls) -> Iterable[str]:
-        yield "workspace"
+        yield "manifest"
 
     def __str__(self) -> str:
-        ws = self.workspace.path_or_uri if self.workspace is not None else "."
-        return f"pixi:{ws}:{self.env}"
+        return f"pixi:{self.manifest.path_or_uri}:{self.env}"
 
 
 class Env(PinnableEnvBase, EnvBase):
     spec: EnvSpec
 
     def __post_init__(self):
-        self._workspace_base = Path.cwd()
+        self._manifest_base = Path.cwd()
         # Python 3.11 cached_property already holds a shared reentrant lock.
         # Adding an outer instance lock there can deadlock nested environments.
         self._shell_hook_lock = Lock() if sys.version_info >= (3, 12) else nullcontext()
 
     @cached_property
+    def manifest_path(self) -> Path:
+        """Resolve the exact original source file after Snakemake rebases it."""
+        manifest = self.spec.manifest.path_or_uri
+        if "://" in str(manifest):
+            raise WorkflowError(
+                "Pixi manifest must be a local file path; manifest URIs are not supported."
+            )
+        # The source cache contains only the manifest, not its sibling lockfile
+        # or local workspace files. Anchor Snakemake's rebased original path.
+        path = (self._manifest_base / manifest).resolve()
+        if path.name not in {"pixi.toml", "pyproject.toml"} or path.is_dir():
+            raise WorkflowError(
+                f"Pixi manifest must identify a pixi.toml or pyproject.toml file: {path}"
+            )
+        if not path.is_file():
+            raise WorkflowError(f"Pixi manifest file not found: {path}")
+        return path
+
+    @property
     def workspace_path(self) -> Path:
-        """Resolve the original local directory relative to the invocation directory."""
-        if self.spec.workspace is not None:
-            # Snakemake resolves path_or_uri relative to the defining rule, but its
-            # file source cache cannot copy a workspace directory or its contents.
-            workspace = self.spec.workspace.path_or_uri
-            if "://" in str(workspace):
-                raise WorkflowError(
-                    "Pixi workspace must be a local directory path; "
-                    "workspace URIs are not supported."
-                )
-            return (self._workspace_base / workspace).resolve()
-        return self._workspace_base
+        """The workspace is the selected manifest's parent directory."""
+        return self.manifest_path.parent
 
     @property
     def lockfile_path(self) -> Path:
@@ -190,18 +200,6 @@ class Env(PinnableEnvBase, EnvBase):
     @cached_property
     def lockfile(self) -> LockFile:
         return _parse_lockfile(self.lockfile_path)
-
-    @property
-    def manifest_path(self) -> Path:
-        """Path to pixi.toml or pyproject.toml in the workspace."""
-        ws = self.workspace_path
-        for name in ("pixi.toml", "pyproject.toml"):
-            p = ws / name
-            if p.exists():
-                return p
-        raise WorkflowError(
-            f"No pixi manifest (pixi.toml or pyproject.toml) found in {ws}"
-        )
 
     @cached_property
     def conda_records(self) -> List[RepoDataRecord]:

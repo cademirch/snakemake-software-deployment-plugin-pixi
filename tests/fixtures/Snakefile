@@ -1,10 +1,8 @@
 # Minimal workflow exercising the pixi software deployment plugin.
 #
 # The `curl` binary is provided by the "tools" environment defined in
-# pixi.toml. With no `workspace` given, the plugin resolves it to the workflow
-# root (cwd) -- so this Snakefile is meant to run from *inside* a pixi
-# workspace (see tests/test_real.py, which copies tests/test_workspace next to
-# a copy of this file).
+# the explicitly selected pixi.toml beside this Snakefile. tests/test_real.py
+# copies tests/test_workspace and this file into a self-contained workflow.
 #
 # The rule records where `curl` resolves to so the test can prove the command
 # ran inside the deployed pixi env (its path should live under
@@ -20,6 +18,6 @@ rule curl_version:
     output:
         "results/curl_version.txt",
     software:
-        pixi(env="tools")
+        pixi(manifest="pixi.toml", env="tools")
     shell:
         "command -v curl > {output} && curl --version >> {output}"

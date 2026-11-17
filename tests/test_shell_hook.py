@@ -29,10 +29,15 @@ def make_env(tmp_path):
         "[workspace]\n[environments]\ntools=[]\nother=[]\nchild=[]\n"
     )
 
-    def factory(shell="bash", name="tools", **options):
+    def factory(shell="bash", name="tools", manifest_name="pixi.toml", **options):
+        manifest = workspace / manifest_name
+        if manifest_name == "pyproject.toml":
+            manifest.write_text(
+                "[tool.pixi.workspace]\n[tool.pixi.environments]\ntools=[]\n"
+            )
         return Env(
             spec=EnvSpec(
-                workspace=EnvSpecSourceFile(workspace, cached=workspace),
+                manifest=EnvSpecSourceFile(manifest, cached=manifest),
                 env=name,
                 **options,
             ),
@@ -63,8 +68,11 @@ def make_env(tmp_path):
         ("fish", "fish"),
     ],
 )
-def test_hook_uses_configured_shell(make_env, monkeypatch, shell, expected):
-    env = make_env(shell=shell)
+@pytest.mark.parametrize("manifest_name", ["pixi.toml", "pyproject.toml"])
+def test_hook_uses_configured_shell(
+    make_env, monkeypatch, shell, expected, manifest_name
+):
+    env = make_env(shell=shell, manifest_name=manifest_name)
     hook = "# Preserve shell-specific syntax and newlines\nactivation-script\n"
     run = Mock(return_value=subprocess.CompletedProcess([], 0, hook, ""))
     monkeypatch.setattr(env, "run_cmd", run)
