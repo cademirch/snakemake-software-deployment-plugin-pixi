@@ -1,9 +1,15 @@
+import asyncio
+import shutil
+from pathlib import Path
+
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from rattler.platform import Platform
 
 from snakemake.deployment import SoftwareDeploymentManager
+from snakemake_interface_executor_plugins.settings import SharedFSUsage
 from snakemake_interface_software_deployment_plugins import EnvSpecSourceFile
 
 from snakemake_software_deployment_plugin_pixi import EnvSpec
@@ -42,7 +48,11 @@ def test_manager_keeps_distinct_workspaces(manager, tmp_path, has_lock):
         workspace.mkdir()
         (workspace / "pixi.toml").write_text("[workspace]\n")
         if has_lock:
-            (workspace / "pixi.lock").write_text("identical lock content")
+            (workspace / "pixi.lock").write_text(
+                "version: 7\nplatforms:\n"
+                f"- name: {Platform.current()}\n"
+                "environments:\n  default:\n    channels: []\n    packages: {}\npackages: []\n"
+            )
 
     first, second = [manager.get_env(make_spec(path)) for path in workspaces]
 
@@ -79,7 +89,6 @@ def test_manager_preserves_lock_policy(
 def test_manifest_changes_invalidate_environment_hash(manager, tmp_path):
     manifest = tmp_path / "pixi.toml"
     manifest.write_text('[dependencies]\npython = "3.12.*"\n')
-    (tmp_path / "pixi.lock").write_text("unchanged lock content")
     before = manager.get_env(make_spec(tmp_path)).hash()
 
     manifest.write_text('[dependencies]\npython = "3.13.*"\n')
@@ -88,3 +97,41 @@ def test_manifest_changes_invalidate_environment_hash(manager, tmp_path):
 
     assert after is not None
     assert after.hash() != before
+
+
+def test_shared_cache_does_not_download_unused_pixi_packages(
+    manager, tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    shutil.copytree(
+        Path(__file__).parent / "test_workspace",
+        workspace,
+        ignore=shutil.ignore_patterns(".pixi", ".snakemake"),
+    )
+    env = manager.get_env(make_spec(workspace, env="tools", frozen=True))
+    workflow = cast(Any, manager.workflow)
+    workflow.storage_settings = SimpleNamespace(
+        shared_fs_usage={SharedFSUsage.SOFTWARE_DEPLOYMENT_CACHE}
+    )
+    workflow.remote_exec = False
+    workflow.dryrun = False
+
+    async def download(asset, to_path):
+        to_path.write_bytes(b"unused package")
+
+    # Replace only package transfer; retain real cache discovery/management.
+    monkeypatch.setattr(env, "cache_asset", download, raising=False)
+    asyncio.run(manager.cache_envs([SimpleNamespace(software_env=env)]))
+
+    assert not [p for p in (tmp_path / "cache").rglob("*") if p.is_file()]
+    assert not env.is_cacheable()
+
+
+def test_manifest_comments_do_not_invalidate_environment_hash(manager, tmp_path):
+    manifest = tmp_path / "pixi.toml"
+    manifest.write_text("[workspace]\n")
+    before = manager.get_env(make_spec(tmp_path)).hash()
+    manifest.write_text("# documentation edit\n[workspace]\n")
+    after = SoftwareDeploymentManager(manager.workflow).get_env(make_spec(tmp_path))
+    assert after is not None
+    assert after.hash() == before

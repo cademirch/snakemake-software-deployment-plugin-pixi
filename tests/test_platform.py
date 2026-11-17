@@ -71,11 +71,6 @@ def test_pin_and_report_use_current_platform(mixed_platform_env, capsys):
     assert pypi_section.splitlines() == [
         "https://example.test/wheel-1.0-py3-none-any.whl",
     ]
-    assert set(asyncio.run(env.get_cache_assets())) == {
-        "tool-1.0-0.conda",
-        "common-1.0-0.conda",
-        "wheel-1.0-py3-none-any.whl",
-    }
     assert {(item.name, item.version) for item in env.report_software()} == {
         ("tool", "1.0"),
         ("common", "1.0"),

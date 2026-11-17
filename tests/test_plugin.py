@@ -202,16 +202,3 @@ def test_pypi_pin_includes_remote_packages_only(pypi_env_with_local_packages):
     assert "https://example.test/remote_wheel-1.0-py3-none-any.whl" in pypi_urls
     assert any("humanfriendly" in url for url in pypi_urls)
     assert all(url.startswith(("https://", "http://")) for url in pypi_urls)
-
-
-def test_pypi_cache_includes_remote_packages_only(pypi_env_with_local_packages):
-    assets = set(asyncio.run(pypi_env_with_local_packages.get_cache_assets()))
-
-    # The async API remains reusable; it must not cache a spent coroutine.
-    assert set(asyncio.run(pypi_env_with_local_packages.get_cache_assets())) == assets
-
-    assert "remote_wheel-1.0-py3-none-any.whl" in assets
-    assert any("humanfriendly" in asset for asset in assets)
-    assert "local-source" not in assets
-    assert "local_wheel-1.0-py3-none-any.whl" not in assets
-    assert "project.git#abcdef" not in assets

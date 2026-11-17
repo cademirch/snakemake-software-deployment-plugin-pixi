@@ -1,4 +1,3 @@
-import asyncio
 import os
 import shlex
 import shutil
@@ -26,7 +25,9 @@ from snakemake_software_deployment_plugin_pixi import Env, EnvSpec
 def make_env(tmp_path):
     workspace = tmp_path / "workspace with spaces"
     workspace.mkdir()
-    (workspace / "pixi.toml").write_text("[workspace]\n")
+    (workspace / "pixi.toml").write_text(
+        "[workspace]\n[environments]\ntools=[]\nother=[]\nchild=[]\n"
+    )
 
     def factory(shell="bash", name="tools", **options):
         return Env(
@@ -292,7 +293,6 @@ def test_preparation_refreshes_lock_metadata_without_changing_identity(
     write_lock("1.0")
     identity = hash(env)
     assert ("marker", "1.0") in {(p.name, p.version) for p in env.report_software()}
-    assert "marker-1.0-py3-none-any.whl" in asyncio.run(env.get_cache_assets())
 
     def prepare(*args, **kwargs):
         write_lock("2.0")
@@ -313,7 +313,4 @@ def test_preparation_refreshes_lock_metadata_without_changing_identity(
     reports = {(p.name, p.version) for p in env.report_software()}
     assert ("marker", "2.0") in reports
     assert ("marker", "1.0") not in reports
-    assets = set(asyncio.run(env.get_cache_assets()))
-    assert "marker-2.0-py3-none-any.whl" in assets
-    assert "marker-1.0-py3-none-any.whl" not in assets
     assert hash(env) == identity
