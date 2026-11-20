@@ -46,7 +46,11 @@ packages:
 """
     )
     return Env(
-        spec=EnvSpec(workspace=EnvSpecSourceFile(tmp_path, cached=tmp_path)),
+        spec=EnvSpec(
+            manifest=EnvSpecSourceFile(
+                tmp_path / "pixi.toml", cached=tmp_path / "pixi.toml"
+            )
+        ),
         within=None,
         settings=None,
         shell_executable=ShellExecutable("bash", "-c"),

@@ -8,7 +8,7 @@ asserts on the produced output. Crucially it checks that `curl` resolved from
 *inside* the deployed pixi prefix -- otherwise the test could pass against a
 system curl and prove nothing about this plugin.
 
-The cold Python workflow also exercises an explicit rule-relative workspace
+The cold Python workflow also exercises an explicit rule-relative manifest
 from a separate working directory, starting without a lockfile or environment.
 """
 
@@ -41,7 +41,7 @@ def test_real_workflow(tmp_path, shell):
     # Build a self-contained workflow dir: the workspace (with its committed
     # pixi.lock) plus the fixture Snakefile at its root.
     ws = tmp_path / "workflow"
-    shutil.copytree(WORKSPACE, ws)
+    shutil.copytree(WORKSPACE, ws, ignore=shutil.ignore_patterns(".pixi"))
     shutil.copyfile(SNAKEFILE, ws / "Snakefile")
 
     result = subprocess.run(
@@ -92,7 +92,7 @@ def test_real_workflow(tmp_path, shell):
 
 @pytest.mark.skipif(not PIXI_AVAILABLE, reason="pixi not installed")
 @pytest.mark.skipif(find_spec("snakemake") is None, reason="snakemake not installed")
-def test_cold_python_workflow_with_rule_relative_workspace(tmp_path):
+def test_cold_python_workflow_with_rule_relative_manifest(tmp_path):
     pipeline = tmp_path / "pipeline"
     rules = pipeline / "rules"
     workspace = pipeline / "envs" / "python"
@@ -113,7 +113,7 @@ def test_cold_python_workflow_with_rule_relative_workspace(tmp_path):
     (rules / "python.smk").write_text(
         "rule python_environment:\n"
         '    output: "python.json"\n'
-        '    software: pixi(workspace="../envs/python")\n'
+        '    software: pixi(manifest="../envs/python/pixi.toml")\n'
         '    script: "python.py"\n'
     )
     (rules / "python.py").write_text(

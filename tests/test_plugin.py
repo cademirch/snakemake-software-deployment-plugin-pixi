@@ -1,5 +1,4 @@
 import asyncio
-import os
 from pathlib import Path
 from typing import Optional, Type
 
@@ -41,13 +40,13 @@ class _PixiTestBase(TestSoftwareDeploymentBase):
 
 
 class TestPixi(_PixiTestBase):
-    """Basic: pixi(workspace=..., env=...)"""
+    """Basic: pixi(manifest=..., env=...)"""
 
     __test__ = True
 
     def get_env_spec(self) -> EnvSpecBase:
         return EnvSpec(
-            workspace=EnvSpecSourceFile(TESTS_DIR / "test_workspace"),
+            manifest=EnvSpecSourceFile(TESTS_DIR / "test_workspace" / "pixi.toml"),
             env="tools",
         )
 
@@ -65,7 +64,7 @@ class TestPixiFrozen(_PixiTestBase):
 
     def get_env_spec(self) -> EnvSpecBase:
         return EnvSpec(
-            workspace=EnvSpecSourceFile(TESTS_DIR / "test_workspace"),
+            manifest=EnvSpecSourceFile(TESTS_DIR / "test_workspace" / "pixi.toml"),
             env="tools",
             frozen=True,
         )
@@ -84,7 +83,7 @@ class TestPixiLocked(_PixiTestBase):
 
     def get_env_spec(self) -> EnvSpecBase:
         return EnvSpec(
-            workspace=EnvSpecSourceFile(TESTS_DIR / "test_workspace"),
+            manifest=EnvSpecSourceFile(TESTS_DIR / "test_workspace" / "pixi.toml"),
             env="tools",
             locked=True,
         )
@@ -103,7 +102,7 @@ class TestPixiNotFrozen(_PixiTestBase):
 
     def get_env_spec(self) -> EnvSpecBase:
         return EnvSpec(
-            workspace=EnvSpecSourceFile(TESTS_DIR / "test_workspace"),
+            manifest=EnvSpecSourceFile(TESTS_DIR / "test_workspace" / "pixi.toml"),
             env="tools",
             frozen=False,
         )
@@ -122,7 +121,7 @@ class TestPixiPypi(_PixiTestBase):
 
     def get_env_spec(self) -> EnvSpecBase:
         return EnvSpec(
-            workspace=EnvSpecSourceFile(TESTS_DIR / "test_workspace_pypi"),
+            manifest=EnvSpecSourceFile(TESTS_DIR / "test_workspace_pypi" / "pixi.toml"),
             env="pypitest",
         )
 
@@ -133,29 +132,6 @@ class TestPixiPypi(_PixiTestBase):
         return (
             "python -c 'import humanfriendly; print(humanfriendly.format_size(1024))'"
         )
-
-
-class TestPixiImplicitWorkspace(_PixiTestBase):
-    """pixi(env="default") with no workspace — resolves to cwd."""
-
-    __test__ = True
-
-    def get_env_spec(self) -> EnvSpecBase:
-        return EnvSpec()  # workspace=None → ".", env="default"
-
-    def get_contained_executable(self) -> str:
-        return "curl"
-
-    def get_test_cmd(self) -> str:
-        return "curl --version"
-
-    def _get_env(self, tmp_path):
-        old_cwd = os.getcwd()
-        os.chdir(TESTS_DIR / "test_workspace")
-        try:
-            return super()._get_env(tmp_path)
-        finally:
-            os.chdir(old_cwd)
 
 
 @pytest.fixture
@@ -188,7 +164,12 @@ def pypi_env_with_local_packages(tmp_path):
     )
     return TestPixiPypi()._get_env_by_cls(
         Env,
-        EnvSpec(workspace=EnvSpecSourceFile(tmp_path, cached=tmp_path), env="pypitest"),
+        EnvSpec(
+            manifest=EnvSpecSourceFile(
+                tmp_path / "pixi.toml", cached=tmp_path / "pixi.toml"
+            ),
+            env="pypitest",
+        ),
         None,
         tmp_path,
     )
