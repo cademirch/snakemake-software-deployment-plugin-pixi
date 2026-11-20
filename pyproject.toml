@@ -10,7 +10,8 @@ dependencies = [
     "snakemake-interface-software-deployment-plugins (>=0.17.0,<1.0)",
     "py-rattler >=0.26.0",
     "aiofiles (>=24.1.0,<25)",
-    "httpx (>=0.28.1,<0.29)",
+    "pyyaml (>=6,<7)",
+    "packaging >=24",
 ]
 
 [tool.pixi.pypi-dependencies]
@@ -59,6 +60,8 @@ cmd = [
     "tests/test_identity.py",
     "tests/test_lifecycle.py",
     "tests/test_platform.py",
+    "tests/test_fingerprint.py",
+    "tests/test_rerun.py",
 ]
 
 [tool.pixi.feature.dev.dependencies]

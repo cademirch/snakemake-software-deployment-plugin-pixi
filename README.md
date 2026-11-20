@@ -50,6 +50,25 @@ Supported shells are Bash, dash, sh, ksh, brush, Zsh, Xonsh, and fish.
 The plugin runs Pixi's activation script before each rule command.
 
 
+### Package cache and software changes
+
+Pixi manages package downloads and the environments in `.pixi/envs`.
+The plugin does not download a second copy into Snakemake's software cache.
+Existing copies in that cache are not removed automatically.
+
+Snakemake detects software changes from the selected environment on the current platform.
+Fingerprints support Pixi lockfile formats 5, 6, and 7.
+The fingerprint includes locked package records, activation variables and scripts, and relevant installation configuration.
+Comments, task definitions, and changes to unrelated environments or platforms do not change it.
+With `frozen=True`, dependency declarations do not affect the fingerprint because Pixi uses the existing lockfile.
+Otherwise, the fingerprint also includes the selected dependency declarations.
+
+Pixi still prepares environments when a job needs them.
+If that preparation creates or updates `pixi.lock`, the next workflow run can rerun affected jobs once more.
+For stable fingerprints from the first run, create the lockfile before running Snakemake.
+Local and editable package source identities are included, but arbitrary edits inside their source trees are not tracked.
+User-wide Pixi configuration is not part of the fingerprint.
+
 ## Development
 
 From this repository, install the development environment:

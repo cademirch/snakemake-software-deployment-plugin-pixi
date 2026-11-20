@@ -1,7 +1,3 @@
-import asyncio
-import shutil
-from pathlib import Path
-
 import pytest
 
 from snakemake_interface_common.exceptions import WorkflowError
@@ -50,32 +46,3 @@ def test_workspace_rejects_remote_directory_sources(tmp_path):
 
     with pytest.raises(WorkflowError, match="local directory"):
         _ = env.workspace_path
-
-
-def test_cache_discovery_defers_unlocked_workspace_until_lock_exists(tmp_path):
-    workspace = EnvSpecSourceFile(tmp_path, cached=tmp_path)
-    env = make_env(tmp_path, workspace=workspace)
-
-    assert list(asyncio.run(env.get_cache_assets())) == []
-    assert not (tmp_path / "pixi.lock").exists()
-    assert not (tmp_path / ".pixi").exists()
-
-    shutil.copyfile(
-        Path(__file__).parent / "test_workspace" / "pixi.lock",
-        tmp_path / "pixi.lock",
-    )
-    assert any(
-        asset.startswith("curl-") for asset in asyncio.run(env.get_cache_assets())
-    )
-
-
-@pytest.mark.parametrize("option", ["frozen", "locked"])
-def test_cache_discovery_rejects_missing_strict_lockfile(tmp_path, option):
-    env = make_env(
-        tmp_path,
-        workspace=EnvSpecSourceFile(tmp_path, cached=tmp_path),
-        **{option: True},
-    )
-
-    with pytest.raises(WorkflowError, match="Pixi lockfile not found"):
-        asyncio.run(env.get_cache_assets())

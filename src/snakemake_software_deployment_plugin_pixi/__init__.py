@@ -10,13 +10,11 @@ from threading import Lock
 from typing import Iterable, List, Optional
 
 import aiofiles
-import httpx
 
 from snakemake_interface_common.exceptions import WorkflowError
 from snakemake_interface_software_deployment_plugins.settings import CommonSettings
 from snakemake_interface_software_deployment_plugins import (
     EnvBase,
-    CacheableEnvBase,
     PinnableEnvBase,
     EnvSpecBase,
     SoftwareReport,
@@ -26,6 +24,8 @@ from snakemake_interface_software_deployment_plugins import (
 from rattler import LockFile, PypiLockedPackage
 from rattler.platform import Platform
 from rattler.repo_data import RepoDataRecord
+
+from ._fingerprint import environment_fingerprint
 
 
 common_settings = CommonSettings(
@@ -159,7 +159,7 @@ class EnvSpec(EnvSpecBase):
         return f"pixi:{ws}:{self.env}"
 
 
-class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
+class Env(PinnableEnvBase, EnvBase):
     spec: EnvSpec
 
     def __post_init__(self):
@@ -291,7 +291,6 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
             "lockfile",
             "conda_records",
             "pypi_packages",
-            "_cache_assets",
         ):
             self.__dict__.pop(attribute, None)
         return hook
@@ -312,14 +311,16 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
     def record_hash(self, hash_object) -> None:
         """Keep workspace activation and lockfile policies distinct during reuse."""
         manifest = self.manifest_path
-        lockfile_path = self.lockfile_path
-        has_lockfile = lockfile_path.exists()
         fields = (
             str(self.workspace_path.resolve()).encode(),
             manifest.name.encode(),
-            manifest.read_bytes(),
-            str(has_lockfile).encode(),
-            lockfile_path.read_bytes() if has_lockfile else b"",
+            environment_fingerprint(
+                manifest,
+                self.lockfile_path,
+                self.spec.env,
+                str(Platform.current()),
+                self.spec.frozen,
+            ),
             self.spec.env.encode(),
             self.pixi_shell.encode(),
             str(self.spec.frozen).encode(),
@@ -358,43 +359,6 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
                         continue
                     await f.write(f"{pkg.location}\n")
 
-    def is_cacheable(self) -> bool:
-        return True
-
-    @cached_property
-    def _cache_assets(self) -> dict:
-        assets: dict = {}
-        # Conda packages
-        for record in self.conda_records:
-            name = _record_to_asset_name(record)
-            assets[name] = ("conda", record)
-        # HTTP(S) artifacts only; local/editable and Git sources are excluded.
-        for pkg in self.pypi_packages:
-            if not _is_remote_url(pkg.location):
-                continue
-            name = _pypi_to_asset_name(pkg)
-            assets[name] = ("pypi", pkg)
-        return assets
-
-    async def get_cache_assets(self) -> Iterable[str]:
-        # Cache discovery also runs during dry runs, before lazy Pixi preparation.
-        # A missing unlocked lockfile must not prevent the first real install.
-        if not self.lockfile_path.exists() and not (
-            self.spec.frozen or self.spec.locked
-        ):
-            return ()
-        return self._cache_assets.keys()
-
-    async def cache_asset(self, asset: str, to_path: Path) -> None:
-        kind, record = self._cache_assets[asset]
-        url = record.url if kind == "conda" else record.location
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            async with aiofiles.open(to_path, "wb") as f:
-                async for chunk in response.aiter_bytes(chunk_size=1024):
-                    await f.write(chunk)
-
     def report_software(self) -> Iterable[SoftwareReport]:
         """Report packages from the lockfile for this environment."""
         reports = []
@@ -416,14 +380,6 @@ class Env(PinnableEnvBase, CacheableEnvBase, EnvBase):
         except Exception:
             pass
         return reports
-
-
-def _record_to_asset_name(record: RepoDataRecord) -> str:
-    return record.url.split("/")[-1]
-
-
-def _pypi_to_asset_name(pkg: PypiLockedPackage) -> str:
-    return pkg.location.split("/")[-1]
 
 
 def _is_remote_url(location: str) -> bool:
